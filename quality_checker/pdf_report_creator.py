@@ -26,6 +26,8 @@ def create_report_single(checker, title, out_path):
     
     pdf = PDF(title)
     pdf.add_page()
+    
+    Path(out_path).mkdir(parents=True, exist_ok=True)
 
     scenario_path = Path(checker.file_path)
     pdf.create_textbox('Scenario file: ' + scenario_path.name, relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
