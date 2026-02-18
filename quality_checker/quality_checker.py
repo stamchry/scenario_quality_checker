@@ -649,31 +649,32 @@ class FileQualityChecker:
         return df
 
     @staticmethod
-    def _calculate_acceleration_swimangle(df):
+    def _calculate_acceleration_swimangle(df, threshold=0.5 / 3.6, rolling_window=20):
         """
         Calculate acceleration and swim angle at every time step.
         Args:
             df: DataFrame with time, x, y, h columns.
+            threshold: Minimum speed threshold for filtering movement angle.
+            rolling_window: Window size for rolling mean calculations.
         return: DataFrame with added speed, acceleration, and swimangle columns.
         """
         # Derived values are finite differences across the trajectory.
-        dt = df['time'].diff()
-        dx = df['x'].diff()
-        dy = df['y'].diff()
+        dt = df['time'].diff().rolling(window=rolling_window, center=True).mean()
+        dx = df['x'].diff().rolling(window=rolling_window, center=True).mean()
+        dy = df['y'].diff().rolling(window=rolling_window, center=True).mean()
         
-        df['speed'] = np.sqrt(dx**2 + dy**2) / dt
+        df['speed'] = (np.sqrt(dx**2 + dy**2) / dt )
         df['acceleration'] = df['speed'].diff() / dt
-
+        
         df['movement_angle'] = np.arctan2(dy, dx)
+        df['movement_angle'] = df['movement_angle'].bfill()
         
-        # fiilter movement angle due to arctan sensitivity to small movements; forward fill to maintain last valid angle
-        magnitude = np.sqrt(dx**2 + dy**2)
-        df['filtered_movement_angle'] = df['movement_angle'].where(magnitude > 0.01).ffill()
+        mask = (df.speed > threshold)
         
-        df['swimangle'] = df['h'] - df['filtered_movement_angle']
+        df['filtered_movement_angle'] = df['movement_angle'].where(mask).ffill().bfill()
+        df['swimangle'] = df['h'].fillna(0) - df['filtered_movement_angle']
         
-        # Normalize to [-pi, pi]
-        df['swimangle'] = (df['swimangle'] + np.pi) % (2 * np.pi) - np.pi
+        df['swimangle'] = ((df['swimangle'] + np.pi) % (2 * np.pi)) - np.pi
         
         return df
     
