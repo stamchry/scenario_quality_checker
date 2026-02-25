@@ -1,10 +1,12 @@
 
 from collections import Counter
+import collections
 import csv
 from datetime import datetime
 from loguru import logger
 import numpy as np
 import os
+import collections
 import pandas as pd
 from pathlib import Path
 import tempfile
@@ -300,13 +302,40 @@ class FileQualityChecker:
                     
                     for maneuver in maneuvergroup.maneuvers:
                         for event in maneuver.events:
-                            if 'Trajectory_event_' in event.name:
-                                for action in event.action: # theres only one action per event
+                            for action in event.action:
+                                if 'trajectory' in dir(action.action):
                                     times = action.action.trajectory.shapes.time
                                     positions = action.action.trajectory.shapes.positions
                                     dynamic_data[actor] = (positions, times)
+                                elif 'route' in dir(action.action):
+                                    speed = self._get_speed_by_actor(actor)
+                                    positions = [waypoint.position for waypoint in action.action.route.waypoints]
+                                    times = np.arange(len(positions)) * 0.04
+                                    dynamic_data[actor] = (positions, times)
+                                else:
+                                    pass
         
         return dynamic_data
+    
+    
+    def _get_speed_by_actor(self, actor):
+        for action in self.scenario.storyboard.init.initactions[actor]:
+            if 'speed' in dir(action):
+                return action.speed
+
+
+    def calculate_distances(self, positions):
+        if not positions:
+            return []
+        
+        pts = np.array([[p.x, p.y] for p in positions])
+
+        origin = pts[0]
+
+        distances = np.linalg.norm(pts - origin, axis=1)
+
+        return distances
+    
 
     def _load_parameter_declarations_outside_storyboard(self):
         """
@@ -620,34 +649,33 @@ class FileQualityChecker:
         return df
 
     @staticmethod
-    def _calculate_acceleration_swimangle(df):
+    def _calculate_acceleration_swimangle(df, threshold=0.5 / 3.6, rolling_window=20):
         """
         Calculate acceleration and swim angle at every time step.
         Args:
             df: DataFrame with time, x, y, h columns.
+            threshold: Minimum speed threshold for filtering movement angle.
+            rolling_window: Window size for rolling mean calculations.
         return: DataFrame with added speed, acceleration, and swimangle columns.
         """
         # Derived values are finite differences across the trajectory.
-        steps = 1
-
-        t_change = df.time[steps:].reset_index(drop=True) - df.time[:-steps].reset_index(drop=True)
-
-        x_change = df.x[steps:].reset_index(drop=True) - df.x[:-steps].reset_index(drop=True)
-        y_change = df.y[steps:].reset_index(drop=True) - df.y[:-steps].reset_index(drop=True)
-        xy_change = np.sqrt(x_change**2 + y_change**2)
-
-        speed = xy_change / t_change
-        df['speed'] = speed
-
-        speed_change = df.speed[steps:].reset_index(drop=True) - df.speed[:-steps].reset_index(drop=True)
-
-        acceleration = speed_change / t_change
-        df['acceleration'] = acceleration
-
-        df['movement_angle'] = np.arctan2(y_change, x_change)
-        df.movement_angle = df.movement_angle.mod(2 * np.pi)
-        df['swimangle'] = df.h - df.movement_angle
-
+        dt = df['time'].diff().rolling(window=rolling_window, center=True).mean()
+        dx = df['x'].diff().rolling(window=rolling_window, center=True).mean()
+        dy = df['y'].diff().rolling(window=rolling_window, center=True).mean()
+        
+        df['speed'] = (np.sqrt(dx**2 + dy**2) / dt )
+        df['acceleration'] = df['speed'].diff() / dt
+        
+        df['movement_angle'] = np.arctan2(dy, dx)
+        df['movement_angle'] = df['movement_angle'].bfill()
+        
+        mask = (df.speed > threshold)
+        
+        df['filtered_movement_angle'] = df['movement_angle'].where(mask).ffill().bfill()
+        df['swimangle'] = df['h'].fillna(0) - df['filtered_movement_angle']
+        
+        df['swimangle'] = ((df['swimangle'] + np.pi) % (2 * np.pi)) - np.pi
+        
         return df
     
     def create_single_report(self, title, out_path):
