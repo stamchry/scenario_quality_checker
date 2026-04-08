@@ -172,7 +172,10 @@ class FileQualityChecker:
             scenario = xosc.ParseOpenScenario(temp_file)
             return scenario
         finally:
-            self._clean_up_temp_file(temp_file)
+            # cleanup temp file
+            temp_path = Path(temp_file)
+            if temp_path.exists():
+                temp_path.unlink()
 
     def _process_xosc_file(self):
         """
@@ -191,17 +194,6 @@ class FileQualityChecker:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.xosc', delete=False, encoding='utf-8') as temp:
             temp.write(updated_content)
             return Path(temp.name)
-
-    def _clean_up_temp_file(self, temp_file):
-        """
-        Delete the temporary file after processing.
-        Args:
-            temp_file: Path to the temporary file.
-        """
-        temp_path = Path(temp_file)
-        if temp_path.exists():
-            temp_path.unlink()
-        return
     
     def get_date(self):
         """
@@ -229,7 +221,7 @@ class FileQualityChecker:
         """
         entities = self._get_entities()
         entity_names = list(entities.keys())
-        missing_entity_definitions = self._are_actors_defined(entity_names)
+        missing_entity_definitions = self._check_actors_defined(entity_names)
 
         init_positions, parked_entities = self._get_initial_positions(entity_names)
         identical_initposition_entities = self._get_identical_initposition_entities(init_positions)
@@ -258,6 +250,10 @@ class FileQualityChecker:
 
         for entity_name in dynamic_data.keys():
             positions, times = dynamic_data[entity_name]
+
+            if len(times) == 0 or any(t is None for t in times):
+                continue
+            
             df = self._build_dynamic_data_df(positions, times)
             df = self._calculate_acceleration_swimangle(df)
 
@@ -297,8 +293,8 @@ class FileQualityChecker:
         for story in self.scenario.storyboard.stories:
             for act in story.acts:
                 for maneuvergroup in act.maneuvergroup:
-                    actors = [actor.entity for actor in maneuvergroup.actors.actors]
-                    actor = actors[0] # theres only one actor per maneuvergroup as of now
+                    # per definition only one actor per maneuver group
+                    actor_name = maneuvergroup.actors.actors[0].entity
                     
                     for maneuver in maneuvergroup.maneuvers:
                         for event in maneuver.events:
@@ -306,37 +302,24 @@ class FileQualityChecker:
                                 if 'trajectory' in dir(action.action):
                                     times = action.action.trajectory.shapes.time
                                     positions = action.action.trajectory.shapes.positions
-                                    dynamic_data[actor] = (positions, times)
+                                    if actor_name in dynamic_data:
+                                        old_positions, old_times = dynamic_data[actor_name]
+                                        dynamic_data[actor_name] = (old_positions + positions, old_times + times)
+                                    else:
+                                        dynamic_data[actor_name] = (positions, times)
                                 elif 'route' in dir(action.action):
-                                    speed = self._get_speed_by_actor(actor)
                                     positions = [waypoint.position for waypoint in action.action.route.waypoints]
-                                    times = np.arange(len(positions)) * 0.04
-                                    dynamic_data[actor] = (positions, times)
+                                    times = [None] * len(positions)
+                                    if actor_name in dynamic_data:
+                                        old_positions, old_times = dynamic_data[actor_name]
+                                        dynamic_data[actor_name] = (old_positions + positions, old_times + times)
+                                    else:
+                                        dynamic_data[actor_name] = (positions, times)
                                 else:
                                     pass
         
         return dynamic_data
     
-    
-    def _get_speed_by_actor(self, actor):
-        for action in self.scenario.storyboard.init.initactions[actor]:
-            if 'speed' in dir(action):
-                return action.speed
-
-
-    def calculate_distances(self, positions):
-        if not positions:
-            return []
-        
-        pts = np.array([[p.x, p.y] for p in positions])
-
-        origin = pts[0]
-
-        distances = np.linalg.norm(pts - origin, axis=1)
-
-        return distances
-    
-
     def _load_parameter_declarations_outside_storyboard(self):
         """
         Extract parameter declarations, excluding any inside Storyboard.
@@ -378,7 +361,7 @@ class FileQualityChecker:
             content = content.replace(placeholder, value)
         return content
 
-    def _are_actors_defined(self, entity_names):
+    def _check_actors_defined(self, entity_names):
         """
         Check if storyboard entities have been defined.
         Args:
