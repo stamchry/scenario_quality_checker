@@ -6,6 +6,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 from pathlib import Path
 import tempfile
+import xml.etree.ElementTree as ET
 
 from .pdf import *
 
@@ -30,7 +31,8 @@ def create_report_single(checker, title, out_path):
     Path(out_path).mkdir(parents=True, exist_ok=True)
 
     scenario_path = Path(checker.file_path)
-    pdf.create_textbox('Scenario file: ' + scenario_path.name, relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
+    pdf.create_textbox('General information', relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
+    pdf.create_textbox('     Scenario file: ' + scenario_path.name, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
 
     # XML must be parsable before any deeper checks are meaningful.
     if checker.xml_loadable:
@@ -39,15 +41,16 @@ def create_report_single(checker, title, out_path):
             # Scenario metadata (fallback to "-" when not provided).
             author = 'Scenario author: '
             author += checker.author if checker.author else '-'
-            pdf.create_textbox(author, relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
+            pdf.create_textbox('     ' + author, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
             
             date = 'Scenario creation date: '
             date += checker.date if checker.date else '-'
-            pdf.create_textbox(date, relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
-            
-            version = 'OpenSCENARIO version: '
-            version += checker.version if checker.version else '-'
-            pdf.create_textbox(version, relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
+            pdf.create_textbox('     ' + date, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
+
+            simulation_status = 'Simulation: '
+            simulation_status_value = getattr(checker, 'simulation_status', 'not done')
+            simulation_status += simulation_status_value
+            simulation_status_color = Config.ERROR_COLOR if simulation_status_value == 'failed' else (0, 0, 0)
             
             # Scenario object required for counts, issues, and dynamics plots.
             if checker.scenario is not None:
@@ -56,16 +59,21 @@ def create_report_single(checker, title, out_path):
                 road_users = checker.road_user_counts or {}
                 n_total = road_users.get('total', 0)
                 n_roadusers += str(n_total)
-                pdf.create_textbox(n_roadusers, relative_position=[0, title_separation+8], font=Config.PDF_FONT_TITLE)
+                pdf.create_textbox('     ' + n_roadusers, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
                 
                 for RU_type, count in road_users.items():
                     if RU_type != 'total' and RU_type is not None:
-                        pdf.create_textbox('     ' + RU_type + 's in scenario: ' + str(count), relative_position=[0, subtitle_separation], 
+                        pdf.create_textbox('     ' + '      - ' + str(count) + ' ' + RU_type + 's', relative_position=[0, subtitle_separation], 
                                            font=Config.PDF_FONT_SUBTITLE)
+
+                pdf.create_textbox('     ' + simulation_status, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE, color=simulation_status_color)
                 
                 # Ensure a stable tuple shape for downstream unpacking.
                 dynamic_errors = checker.dynamic_errors or ([], [], [], [])
                 acceleration_errors, acceleration_warnings, swimangle_errors, swimangle_warnings = dynamic_errors
+                simulation_based_dynamics = simulation_status_value == 'succeeded'
+                simulation_not_valid = simulation_status_value != 'succeeded'
+                dynamic_has_footnote = simulation_based_dynamics or simulation_not_valid
                 analyzed_dynamics = {
                     "acceleration_errors": acceleration_errors,
                     "acceleration_warnings": acceleration_warnings,
@@ -82,12 +90,13 @@ def create_report_single(checker, title, out_path):
                 except Exception:
                     pass
 
-                pdf.create_textbox('Scenario issues', relative_position=[0, title_separation+2], font=Config.PDF_FONT_TITLE)
+                pdf.create_textbox('Scenario evaluation', relative_position=[0, title_separation+5], font=Config.PDF_FONT_TITLE)
                 # Grouped file-level issues (empty lists mean no issues).
                 file_errors = checker.file_errors or ([], [], [], [])
+                position_resolution_warnings = getattr(checker, 'position_resolution_warnings', []) or []
                 # File issues section: show green checks when none exist.
                 if np.sum([len(file_error) for file_error in file_errors]) == 0:
-                    pdf.create_textbox(text="4", relative_position=[0, title_separation], font=Config.PDF_FONT_DING_TITLE)
+                    pdf.create_textbox(text="4", relative_position=[0, title_separation+2], font=Config.PDF_FONT_DING_TITLE)
                     pdf.create_textbox('     No file issues: ', relative_position=[0, 2*title_separation], font=Config.PDF_FONT_TITLE_SMALL)
                     pdf.create_textbox(text="     4", relative_position=[0, subtitle_separation], font=Config.PDF_FONT_DING_SUB)
                     pdf.create_textbox('          No faulty entity definitions', relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
@@ -97,10 +106,17 @@ def create_report_single(checker, title, out_path):
                     pdf.create_textbox('          No intersecting entities', relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
                     pdf.create_textbox(text="     4", relative_position=[0, subtitle_separation], font=Config.PDF_FONT_DING_SUB)
                     pdf.create_textbox('          No missing adds/inits', relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
+
+                    if len(position_resolution_warnings) > 0:
+                        for warning in position_resolution_warnings:
+                            pdf.create_textbox(text="     8", relative_position=[0, subtitle_separation], 
+                                               font=Config.PDF_FONT_DING_SUB, color=Config.WARNING_COLOR)
+                            pdf.create_textbox('          ' + warning, relative_position=[0, 2*subtitle_separation], 
+                                               font=Config.PDF_FONT_SUBTITLE, color=Config.WARNING_COLOR)
                 else:
                     # File issues section: show errors per category.
                     missing_entity_definitions, identical_initposition_entities, intersecting_entities, missing_in = file_errors
-                    pdf.create_textbox(text="8", relative_position=[0, title_separation], 
+                    pdf.create_textbox(text="8", relative_position=[0, title_separation+2], 
                                        font=Config.PDF_FONT_DING_TITLE, color=Config.ERROR_COLOR)
                     pdf.create_textbox('     File issues', relative_position=[0, 2*title_separation], 
                                        font=Config.PDF_FONT_TITLE_SMALL, color=Config.ERROR_COLOR)
@@ -167,11 +183,19 @@ def create_report_single(checker, title, out_path):
                                            font=Config.PDF_FONT_DING_SUB)
                         pdf.create_textbox('          No missing adds/inits', relative_position=[0, 2*subtitle_separation], 
                                            font=Config.PDF_FONT_SUBTITLE)
+
+                    if len(position_resolution_warnings) > 0:
+                        for warning in position_resolution_warnings:
+                            pdf.create_textbox(text="     8", relative_position=[0, subtitle_separation], 
+                                               font=Config.PDF_FONT_DING_SUB, color=Config.WARNING_COLOR)
+                            pdf.create_textbox('          ' + warning, relative_position=[0, 2*subtitle_separation], 
+                                               font=Config.PDF_FONT_SUBTITLE, color=Config.WARNING_COLOR)
                     
                 # Dynamic issues section: show green checks when none exist.
                 if np.sum([len(dynamic_error) for dynamic_error in dynamic_errors]) == 0:
-                    pdf.create_textbox(text="4", relative_position=[0, title_separation+2], font=Config.PDF_FONT_DING_TITLE)
-                    pdf.create_textbox('     No dynamic issues', relative_position=[0, 2*title_separation], font=Config.PDF_FONT_TITLE_SMALL)
+                    dynamic_no_issues_title = '     No dynamic issues*' if dynamic_has_footnote else '     No dynamic issues'
+                    pdf.create_textbox(text="4", relative_position=[0, title_separation+4], font=Config.PDF_FONT_DING_TITLE)
+                    pdf.create_textbox(dynamic_no_issues_title, relative_position=[0, 2*title_separation], font=Config.PDF_FONT_TITLE_SMALL)
                     pdf.create_textbox(text="     4", relative_position=[0, subtitle_separation], font=Config.PDF_FONT_DING_SUB)
                     pdf.create_textbox('          No acceleration errors', relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
                     pdf.create_textbox(text="     4", relative_position=[0, subtitle_separation], font=Config.PDF_FONT_DING_SUB)
@@ -182,9 +206,10 @@ def create_report_single(checker, title, out_path):
                     pdf.create_textbox('          No swim angle warnings', relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE)
                 else:
                     # Dynamic issues section: errors/warnings per category.
-                    pdf.create_textbox(text="8", relative_position=[0, title_separation+1], 
+                    dynamic_issues_title = '     Dynamic issues*' if dynamic_has_footnote else '     Dynamic issues'
+                    pdf.create_textbox(text="8", relative_position=[0, title_separation+4], 
                                        font=Config.PDF_FONT_DING_TITLE, color=Config.ERROR_COLOR)
-                    pdf.create_textbox('     Dynamic issues', relative_position=[0, 2*title_separation], 
+                    pdf.create_textbox(dynamic_issues_title, relative_position=[0, 2*title_separation], 
                                        font=Config.PDF_FONT_TITLE_SMALL, color=Config.ERROR_COLOR)
                     # Acceleration errors.
                     if len(acceleration_errors) > 0:
@@ -249,6 +274,19 @@ def create_report_single(checker, title, out_path):
                     pdf.create_textbox("Note: Graphs could not be generated because envelope does not contain any stories.", 
                                     relative_position=[0, 135], font=Config.PDF_FONT_SUBTITLE_REGULAR)
 
+                if simulation_based_dynamics:
+                    pdf.create_textbox(
+                        "* Dynamic evaluation is influenced by simulator interpretion.",
+                        relative_position=[0, 2],
+                        font=Config.PDF_FONT_SUBTITLE_REGULAR,
+                    )
+                elif simulation_not_valid:
+                    pdf.create_textbox(
+                        "* Assessment only based on TrajectoryActions.",
+                        relative_position=[0, 2],
+                        font=Config.PDF_FONT_SUBTITLE_REGULAR,
+                    )
+
                 temp_dir.cleanup()
                     
                 report_file = Path(scenario_path.stem + '.pdf')
@@ -262,6 +300,29 @@ def create_report_single(checker, title, out_path):
         else:
             # XML is parseable but does not validate against the XSD.
             pdf.create_textbox('File is not in XSD format', relative_position=[0, title_separation], font=Config.PDF_FONT_TITLE)
+
+            # If available, include concrete XSD validation messages in the PDF.
+            xsd_errors = getattr(checker, 'xsd_errors', []) or []
+            if len(xsd_errors) > 0:
+                # Start the XSD error block a bit further below the heading.
+                pdf.create_textbox('XSD validation errors:', relative_position=[0, 0], font=Config.PDF_FONT_TITLE_SMALL, color=Config.ERROR_COLOR)
+
+                # Show each error fully, but wrapped into multiple lines so that
+                # it fits into the page width.
+                max_len = 120
+                for err in xsd_errors:
+                    full_text = ' - ' + str(err)
+                    text = full_text
+                    first_line = True
+                    while len(text) > max_len:
+                        line = text[:max_len]
+                        pdf.create_textbox(line, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE, color=Config.ERROR_COLOR)
+                        # Indent continuation lines slightly.
+                        text = '   ' + text[max_len:]
+                        first_line = False
+                    # Remainder (or whole text if shorter than max_len).
+                    pdf.create_textbox(text, relative_position=[0, subtitle_separation], font=Config.PDF_FONT_SUBTITLE, color=Config.ERROR_COLOR)
+
             out = out_path / Path(scenario_path.stem + '.pdf')
             pdf.output(out)
     else:
@@ -417,26 +478,30 @@ def create_report_multiple(title, file_information, out_path, print_log=False):
         ' ' * 10 + 'Scenario files'
         + ' ' * 55 + 'XML loadable'
         + ' ' * 12 + 'XSD valid'
-        + ' ' * 11 + 'File issues'
+        + ' ' * 10 + 'Simulation'
+        + ' ' * 10 + 'File issues'
         + ' ' * 8 + 'Dynamic issues', relative_position=[0, title_separation], font=Config.PDF_FONT_SUBTITLE)
     
-    # file = (path, xml_loadable, xsd_valid, n_file_issues, n_dynamic_issues)
+    # file = (path, xml_loadable, xsd_valid, simulation_status, n_file_issues, n_dynamic_issues)
     for file in file_information:
-        if file[1] and file[2] and file[3] == 0 and file[4] == 0:
+        if file[1] and file[2] and file[4] == 0 and file[5] == 0 and file[3] != 'failed':
             pdf.create_textbox(text="     4", relative_position=[0, subtitle_separation], font=Config.PDF_FONT_DING_SUB)
             pdf.create_textbox('          ' + file[0].parts[-1], relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
             pdf.create_textbox((" " * 100) + "4" * int(file[1]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_DING_SUB)
             pdf.create_textbox((" " * 130) + "4" * int(file[2]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_DING_SUB)
-            pdf.create_textbox((" " * 160) + str('0'), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
-            pdf.create_textbox((" " * 190) + str('0'), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
+            pdf.create_textbox((" " * 148) + str(file[3]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
+            pdf.create_textbox((" " * 178) + str('0'), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
+            pdf.create_textbox((" " * 205) + str('0'), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
         else:
-            # Mindestens eine Prüfung fehlgeschlagen oder es gibt Probleme
+            # At least one check failed or issues are present.
             pdf.create_textbox(text="     8", relative_position=[0, subtitle_separation], font=Config.PDF_FONT_DING_SUB, color=Config.ERROR_COLOR)
             pdf.create_textbox(' ' * 10 + file[0].parts[-1], relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
             pdf.create_textbox((" " * 100) + ("4" * int(file[1])) + ("8" * (1-int(file[1]))), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_DING_SUB)
             pdf.create_textbox((" " * 130) + ("4" * int(file[2])) + ("8" * (1-int(file[2]))), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_DING_SUB)
-            pdf.create_textbox((" " * 160) + str(file[3]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
-            pdf.create_textbox((" " * 190) + str(file[4]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
+            sim_color = Config.ERROR_COLOR if file[3] == 'failed' else None
+            pdf.create_textbox((" " * 148) + str(file[3]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR, color=sim_color)
+            pdf.create_textbox((" " * 178) + str(file[4]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
+            pdf.create_textbox((" " * 205) + str(file[5]), relative_position=[0, 2*subtitle_separation], font=Config.PDF_FONT_SUBTITLE_REGULAR)
         pdf.create_line(color=(0, 0, 0), relative_position=[0, -2])
 
     out = out_path / Path('aggregate_report.pdf' )
@@ -523,7 +588,117 @@ def plot_vehicle_paths(dynamic_data, checker, segment_size=10, arrow_size=1, sav
     output_dir = Path(output_dir) if output_dir else Path('.')
     paths_plot = plt.figure()
     paths_ax = paths_plot.add_subplot(111)
+
+    # draw background map if xodr is available
+    try:
+        xodr_path = checker.get_xodr_path()
+    except AttributeError:
+        xodr_path = None
+
+    if xodr_path is not None:
+        try:
+            tree = ET.parse(xodr_path)
+            root = tree.getroot()
+
+            def _sample_geometry_points(geom, points_per_meter=10.0):
+                """Sample one OpenDRIVE geometry segment into XY polyline points."""
+                try:
+                    x0 = float(geom.get("x", 0.0))
+                    y0 = float(geom.get("y", 0.0))
+                    hdg = float(geom.get("hdg", 0.0))
+                    length = float(geom.get("length", 0.0))
+                except (TypeError, ValueError):
+                    return [], []
+
+                if length <= 0.0:
+                    return [], []
+
+                n_samples = max(int(np.ceil(length * points_per_meter)), 2)
+                s_vals = np.linspace(0.0, length, n_samples)
+
+                # Identify geometry type by first child element.
+                geom_type = None
+                geom_child = None
+                for child in geom:
+                    if child.tag.endswith("line"):
+                        geom_type = "line"
+                        geom_child = child
+                        break
+                    if child.tag.endswith("arc"):
+                        geom_type = "arc"
+                        geom_child = child
+                        break
+
+                # Fallback to straight segment when geometry type is unknown.
+                if geom_type == "arc" and geom_child is not None:
+                    try:
+                        curvature = float(geom_child.get("curvature", 0.0))
+                    except (TypeError, ValueError):
+                        curvature = 0.0
+
+                    if abs(curvature) < 1e-10:
+                        xs = x0 + s_vals * np.cos(hdg)
+                        ys = y0 + s_vals * np.sin(hdg)
+                    else:
+                        # Circular arc integration in inertial XY coordinates.
+                        xs = x0 + (np.sin(hdg + curvature * s_vals) - np.sin(hdg)) / curvature
+                        ys = y0 - (np.cos(hdg + curvature * s_vals) - np.cos(hdg)) / curvature
+                else:
+                    xs = x0 + s_vals * np.cos(hdg)
+                    ys = y0 + s_vals * np.sin(hdg)
+
+                return xs.tolist(), ys.tolist()
+
+            # Handle possible XML namespaces by checking tag endings.
+            for road in root.iter():
+                if not road.tag.endswith("road"):
+                    continue
+
+                plan_view = None
+                for child in road:
+                    if child.tag.endswith("planView"):
+                        plan_view = child
+                        break
+                if plan_view is None:
+                    continue
+
+                geometries = []
+                for geom in plan_view:
+                    if not geom.tag.endswith("geometry"):
+                        continue
+                    try:
+                        s = float(geom.get("s", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    geometries.append((s, geom))
+
+                if len(geometries) == 0:
+                    continue
+
+                geometries.sort(key=lambda p: p[0])
+                road_xs = []
+                road_ys = []
+
+                # Build one continuous polyline per road from all geometry segments.
+                for _, geom in geometries:
+                    seg_xs, seg_ys = _sample_geometry_points(geom)
+                    if len(seg_xs) == 0:
+                        continue
+
+                    # Avoid duplicating points at segment boundaries.
+                    if len(road_xs) > 0 and np.isclose(road_xs[-1], seg_xs[0]) and np.isclose(road_ys[-1], seg_ys[0]):
+                        seg_xs = seg_xs[1:]
+                        seg_ys = seg_ys[1:]
+
+                    road_xs.extend(seg_xs)
+                    road_ys.extend(seg_ys)
+
+                if len(road_xs) >= 2:
+                    paths_ax.plot(road_xs, road_ys, color="lightgrey", linewidth=0.9, zorder=-20)
+        except Exception:
+            pass
     
+    # plot vehicle data
     for entity_name in dynamic_data.keys():
         positions, times = dynamic_data[entity_name]
         df = checker._build_dynamic_data_df(positions, times)
@@ -550,6 +725,7 @@ def plot_vehicle_paths(dynamic_data, checker, segment_size=10, arrow_size=1, sav
     paths_ax.legend(handles=legend_elements)
     paths_ax.set_xlabel('X [m]')
     paths_ax.set_ylabel('Y [m]')
+    paths_ax.set_aspect('equal', adjustable='box')
     paths_ax.set_title('Vehicle paths')
 
     if save:

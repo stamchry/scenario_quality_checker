@@ -2,6 +2,7 @@
 from collections import Counter
 import collections
 import csv
+import io
 from datetime import datetime
 from loguru import logger
 import numpy as np
@@ -10,6 +11,9 @@ import collections
 import pandas as pd
 from pathlib import Path
 import tempfile
+import subprocess
+import shlex
+import shutil
 from scenariogeneration import xosc
 import scipy as sp
 import shapely
@@ -23,35 +27,43 @@ import xmlschema
 from .config import Config
 from .pdf import *
 from .pdf_report_creator import *
+from .xodr_position_resolver import OpenDrivePositionResolver
 
-app = typer.Typer()   
+app = typer.Typer()
 
 
 class FileQualityChecker:
-    def __init__(self, scenario_path, schema_path, print_log=False):
+    def __init__(self, scenario_path, schema_path, esmini_path=None, print_log=False):
         """
         Initialize the checker and run the full validation pipeline.
         Args:
             scenario_path: Path to the .xosc scenario file.
             schema_path: Path to the directory with XSD schemas.
+            use_simulation: Whether to use simulation for dynamic checks.
             print_log: Whether to emit log output.
         """
         self.file_path = scenario_path
         self.print_log = print_log
-        
+        self.esmini_path = esmini_path
+
         self.xml_loadable = False
         self.xsd_valid = False
+        self.xsd_errors = []
         self.version = None
         self.author = None
         self.date = None
         self.scenario = None
         self.road_user_counts = Counter()
         self.file_errors = ([], [], [], [])
+        self.position_resolution_warnings = []
         self.dynamic_errors = None
-        
+        self.dynamic_data = None
+        self.simulation_status = 'not done'
+        self._xodr_resolver = OpenDrivePositionResolver()
+
         if self.print_log:
             logger.info(f'Starting analysis of {self.file_path}')
-        
+
         # Parse XML early to avoid downstream schema/scenario errors.
         self.xml_loadable = self.is_xml_loadable()
         if not self.xml_loadable:
@@ -65,13 +77,13 @@ class FileQualityChecker:
             return
         elif print_log == True:
             logger.info('XSD is valid')
-            
+
         # Parse with scenariogeneration to access scenario structure.
         self.scenario = self.load_openscenario()
-        
+
         if self.scenario is None:
             return
-        
+
         # Metadata is read from the parsed scenario header.
         self.author = self.scenario.header.get_attributes()['author']
         self.date = self.get_date()
@@ -80,26 +92,26 @@ class FileQualityChecker:
         entities, self.file_errors = self.check_file_errors()
         self.road_user_counts = Counter(entities.values())
         self.road_user_counts['total'] = str(len(entities))
-        
+
         # Dynamic checks (acceleration and swim angle thresholds).
-        self.dynamic_errors = self.check_dynamic_errors()           
-            
+        self.dynamic_errors = self.check_dynamic_errors()
+
     def to_summary_row(self):
         """
         Return a compact summary tuple for aggregated reports.
         Args:
             None
-        return: Tuple of (file_path, xml_loadable, xsd_valid, n_file_errors, n_dynamic_errors)
+        return: Tuple of (file_path, xml_loadable, xsd_valid, simulation_status, n_file_errors, n_dynamic_errors)
         """
         # Keep values stable even when earlier stages failed.
         if not self.xml_loadable:
-            return (self.file_path, False, False, '-', '-')
+            return (self.file_path, False, False, self.simulation_status, '-', '-')
 
         if not self.xsd_valid:
-            return (self.file_path, True, False, '-', '-')
+            return (self.file_path, True, False, self.simulation_status, '-', '-')
 
         if self.scenario is None:
-            return (self.file_path, True, True, '-', '-')
+            return (self.file_path, True, True, self.simulation_status, '-', '-')
 
         try:
             file_error_count = sum(len(items) for items in self.file_errors)
@@ -113,7 +125,7 @@ class FileQualityChecker:
         except Exception:
             dynamic_error_count = '-'
 
-        return (self.file_path, True, True, file_error_count, dynamic_error_count)
+        return (self.file_path, True, True, self.simulation_status, file_error_count, dynamic_error_count)
 
     def is_xml_loadable(self):
         """
@@ -129,7 +141,7 @@ class FileQualityChecker:
             return True
         except Exception as e:
             return False
-        
+
     def is_xsd_valid(self, schema_path):
         """
         Check whether the file validates against an available XSD schema.
@@ -143,23 +155,58 @@ class FileQualityChecker:
         revMajor = root[0].attrib['revMajor']
         revMinor = root[0].attrib['revMinor']
         xsd_version = revMajor + '-' + revMinor
-        
+
+        # Reset stored errors on each validation run.
+        self.xsd_errors = []
+
         # Schema files exist for v1.x only; v2+ is treated as unsupported here.
         if int(revMajor) < 2:
             file = Path('OpenSCENARIO_' + xsd_version + '.xsd')
             schema_file = schema_path / file
-        else: 
-            # print('File version ' + xsd_version + ' is NOT known')
+        else:
+            msg = f"File version {xsd_version} is not supported (no schema for revMajor >= 2)."
+            self.xsd_errors.append(msg)
+            if self.print_log:
+                logger.error(msg)
             return (False, xsd_version)
-        
-        if not os.path.isfile(schema_file):
-            # print('Schema file for version ' + xsd_version + ' is NOT available')
-            return (False, xsd_version)
-        
-        xsd = xmlschema.XMLSchema(schema_file)
 
-        return (xsd.is_valid(self.file_path), xsd_version)     
-        
+        if not os.path.isfile(schema_file):
+            msg = f"Schema file for version {xsd_version} not available: {schema_file}"
+            self.xsd_errors.append(msg)
+            if self.print_log:
+                logger.error(msg)
+            return (False, xsd_version)
+
+        xsd = xmlschema.XMLSchema(schema_file)
+        is_valid = xsd.is_valid(self.file_path)
+
+        # If validation fails, collect and log detailed errors.
+        if not is_valid:
+            try:
+                # Limit the number of stored errors to keep PDFs readable.
+                max_errors = 20
+                for idx, error in enumerate(xsd.iter_errors(self.file_path)):
+                    if idx >= max_errors:
+                        more_msg = f"... and more XSD errors (showing first {max_errors})."
+                        self.xsd_errors.append(more_msg)
+                        if self.print_log:
+                            logger.error(more_msg)
+                        break
+                    # Build a concise description including path and message.
+                    err_msg = f"{error.path}: {error.message}"
+                    self.xsd_errors.append(err_msg)
+                    if self.print_log:
+                        logger.error(
+                            f"XSD validation error in {self.file_path} (version {xsd_version}): {err_msg}"
+                        )
+            except Exception as e:
+                fallback_msg = f"Failed to collect XSD validation errors for {self.file_path}: {e}"
+                self.xsd_errors.append(fallback_msg)
+                if self.print_log:
+                    logger.error(fallback_msg)
+
+        return (is_valid, xsd_version)
+
     def load_openscenario(self):
         """
         Load an OpenSCENARIO file (.xosc) via scenariogeneration.
@@ -191,9 +238,16 @@ class FileQualityChecker:
 
         updated_content = self._replace_parameters_in_content(content, parameters)
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.xosc', delete=False, encoding='utf-8') as temp:
+        # Write the processed scenario into the persistent results/tmp folder
+        # to avoid OS-level temp paths that might be hard to inspect.
+        project_root = Path.cwd()
+        tmp_root = project_root / "results" / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+
+        temp_path = tmp_root / f"processed_{Path(self.file_path).name}"
+        with open(temp_path, mode="w", encoding="utf-8") as temp:
             temp.write(updated_content)
-            return Path(temp.name)
+        return temp_path
     
     def get_date(self):
         """
@@ -223,7 +277,20 @@ class FileQualityChecker:
         entity_names = list(entities.keys())
         missing_entity_definitions = self._check_actors_defined(entity_names)
 
-        init_positions, parked_entities = self._get_initial_positions(entity_names)
+        init_positions, parked_entities, unresolved_no_xodr, unresolved_conversion = self._get_initial_positions(entity_names)
+
+        self.position_resolution_warnings = []
+        if len(unresolved_no_xodr) > 0:
+            self.position_resolution_warnings.append(
+                "Warning: Initial overlap for local LanePosition is not assessable without valid OpenDRIVE (.xodr): "
+                + ", ".join(sorted(unresolved_no_xodr))
+            )
+        if len(unresolved_conversion) > 0:
+            self.position_resolution_warnings.append(
+                "Warning: Initial overlap could not be resolved from OpenDRIVE for: "
+                + ", ".join(sorted(unresolved_conversion))
+            )
+
         identical_initposition_entities = self._get_identical_initposition_entities(init_positions)
         intersecting_entities = self._get_intersecting_entities(init_positions)
 
@@ -286,16 +353,44 @@ class FileQualityChecker:
         """
         Return positions and times for each actor's trajectory events.
         Args:
-            None
+            use_simulation: Whether to use simulation for dynamic checks.
+            esmini_path: Path to the esmini executable.
         return: Dict mapping entity name to (positions, times).
         """
+        # Make sure that calculation is only done once.
+        if self.dynamic_data is not None:
+            return self.dynamic_data
+
+        # If requested, derive trajectories from an external simulator (e.g. esmini).
+        if self.esmini_path:
+            try:
+                self.dynamic_data = self._get_dynamic_data_from_simulation()
+                self.simulation_status = 'succeeded'
+                return self.dynamic_data
+            except Exception as e:
+                self.simulation_status = 'failed'
+                if self.print_log:
+                    logger.warning(
+                        f"Simulation-based dynamics extraction failed for {self.file_path}: {e}. "
+                        "Falling back to trajectory actions from the scenario file."
+                    )
+                self.dynamic_data = self._get_dynamic_data_from_scenario()
+                return self.dynamic_data
+
+        self.simulation_status = 'not done'
+        self.dynamic_data = self._get_dynamic_data_from_scenario()
+        return self.dynamic_data
+
+    def _get_dynamic_data_from_scenario(self):
+        """Extract dynamic data directly from scenario trajectory/route actions."""
         dynamic_data = {}
+
         for story in self.scenario.storyboard.stories:
             for act in story.acts:
                 for maneuvergroup in act.maneuvergroup:
-                    # per definition only one actor per maneuver group
+                    # Per definition only one actor per maneuver group.
                     actor_name = maneuvergroup.actors.actors[0].entity
-                    
+
                     for maneuver in maneuvergroup.maneuvers:
                         for event in maneuver.events:
                             for action in event.action:
@@ -317,7 +412,282 @@ class FileQualityChecker:
                                         dynamic_data[actor_name] = (positions, times)
                                 else:
                                     pass
-        
+
+        return dynamic_data
+
+    def _get_dynamic_data_from_simulation(self):
+        """Run esmini and build dynamic_data from its log.
+
+        The esmini command is currently hard-coded. It runs esmini in
+        headless mode on the current scenario file and writes a CSV log
+        which is then parsed for dynamic checks.
+        """
+        # Use a persistent temp folder under results/tmp for easier
+        # inspection of intermediate files and logs.
+        project_root = Path.cwd()
+        tmp_root = project_root / "results" / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+
+        scenario_tmp = tmp_root / "scenario_for_esmini.xosc"
+        shutil.copy2(self.file_path, scenario_tmp)
+
+        # Optionally adjust RoadNetwork -> LogicFile so that any referenced
+        # OpenDRIVE file is resolved to an absolute path; otherwise keep
+        # RoadNetwork but remove invalid LogicFile children.
+        try:
+            tree = ET.parse(scenario_tmp)
+            root = tree.getroot()
+            xosc_dir = Path(self.file_path).parent
+
+            road_network = root.find("RoadNetwork")
+            if road_network is not None:
+                logic_file = road_network.find("LogicFile")
+                if logic_file is not None and "filepath" in logic_file.attrib:
+                    rel_path = logic_file.attrib["filepath"]
+                    candidate = (xosc_dir / rel_path).resolve()
+                    if candidate.is_file():
+                        logic_file.set("filepath", str(candidate))
+                    else:
+                        # No valid .xodr found: keep an empty RoadNetwork.
+                        for child in list(road_network):
+                            road_network.remove(child)
+                else:
+                    # No LogicFile defined: keep an empty RoadNetwork.
+                    for child in list(road_network):
+                        road_network.remove(child)
+
+            # Convert all remaining relative path-like attributes to absolute
+            # paths, so the copied scenario in results/tmp can be loaded
+            # without relying on its original working directory.
+            for elem in root.iter():
+                for attr_name, attr_value in list(elem.attrib.items()):
+                    if not attr_value:
+                        continue
+
+                    val = attr_value.strip()
+                    if not ("/" in val or "\\" in val or val.startswith("..")):
+                        continue
+
+                    # Skip already-absolute Windows paths (e.g. C:\...).
+                    if os.path.isabs(val):
+                        continue
+
+                    candidate = (xosc_dir / val).resolve()
+                    if candidate.exists():
+                        elem.set(attr_name, str(candidate))
+
+            tree.write(scenario_tmp, encoding="utf-8", xml_declaration=True)
+        except Exception:
+            # If anything goes wrong while tweaking RoadNetwork, fall back
+            # to the plain copied scenario file.
+            pass
+
+        log_file = tmp_root / "esmini_log.csv"
+
+        cmd = [
+            self.esmini_path,
+            "--headless",
+            "--csv_logger",
+            str(log_file),
+            "--osc",
+            str(scenario_tmp),
+        ]
+
+        # Run esmini quietly (no console spam); only use return code
+        # for error handling. Detailed issues are still logged via
+        # the CSV and our own logger.
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        if result.returncode != 0:
+            logger.error(
+                f"esmini command failed with exit code {result.returncode} "
+                f"while running {scenario_tmp}"
+            )
+            raise RuntimeError(
+                f"Simulator command failed with exit code {result.returncode}"
+            )
+
+        if not log_file.exists():
+            raise RuntimeError(
+                f"Simulator finished successfully, but log file {log_file} was not created. "
+                "Check the hard-coded esmini command."
+            )
+
+        # Parse simulation output and then clean up temporary artifacts
+        dynamic_data = self._parse_simulation_log(log_file)
+
+        try:
+            if scenario_tmp.exists():
+                scenario_tmp.unlink()
+            if log_file.exists():
+                log_file.unlink()
+            # Remove tmp_root only when it is empty; ignore errors if not.
+            try:
+                tmp_root.rmdir()
+            except OSError:
+                pass
+        except Exception:
+            pass
+
+        return dynamic_data
+
+    def get_xodr_path(self):
+        """Return the resolved OpenDRIVE (.xodr) file path if available.
+
+        The method inspects the original scenario's RoadNetwork/LogicFile
+        element and resolves a relative "filepath" against the scenario
+        directory. If the referenced file exists, its absolute Path is
+        returned; otherwise, None is returned.
+        """
+        try:
+            tree = ET.parse(self.file_path)
+            root = tree.getroot()
+        except Exception:
+            return None
+
+        road_network = root.find("RoadNetwork")
+        if road_network is None:
+            return None
+
+        logic_file = road_network.find("LogicFile")
+        if logic_file is None:
+            return None
+
+        rel_path = logic_file.attrib.get("filepath")
+        if not rel_path:
+            return None
+
+        scenario_dir = Path(self.file_path).parent
+        candidate = (scenario_dir / rel_path).resolve()
+        if candidate.is_file():
+            return candidate
+        return None
+
+    def _parse_simulation_log(self, log_file: Path):
+        """Parse a simulator log file into the dynamic_data structure.
+
+        Currently supports the CSV format written by esmini's --csv_logger,
+        which looks like:
+
+        - A few metadata lines (git rev, build version, etc.)
+        - One long header line starting with "Index [-] , TimeStamp [s] , ..."
+        - One data row per timestamp containing columns for #1, #2, ...
+          entities (Entitity_Name, World_Position_X/Y, World_Heading_Angle, ...).
+        """
+        dynamic_data = {}
+
+        # Read all lines first so we can skip esmini's metadata banner and
+        # start CSV parsing at the actual header row.
+        with open(log_file, encoding="utf-8") as f:
+            lines = f.readlines()
+
+        header_index = None
+        for idx, line in enumerate(lines):
+            if "Index" in line and "TimeStamp" in line:
+                header_index = idx
+                break
+
+        if header_index is None:
+            raise RuntimeError(
+                "Simulation log file does not contain an esmini CSV header line "
+                "(expected a line starting with 'Index [-] , TimeStamp [s] , ...')."
+            )
+
+        csv_text = "".join(lines[header_index:])
+        reader = csv.DictReader(io.StringIO(csv_text))
+        if not reader.fieldnames:
+            raise RuntimeError("Simulation log file has no header row.")
+
+        # esmini's CSV headers often contain leading/trailing spaces around
+        # names (e.g. " TimeStamp [s] "). We therefore build a mapping
+        # from stripped header names to their original forms and use the
+        # original names when indexing row dictionaries.
+        original_headers = [h for h in reader.fieldnames if h is not None]
+        header_map = {h.strip(): h for h in original_headers}
+        headers = list(header_map.keys())
+
+        # Identify the global time column (TimeStamp [s]).
+        time_col = None
+        for name in headers:
+            if "timestamp" in name.lower():
+                time_col = header_map[name]
+                break
+
+        if not time_col:
+            raise RuntimeError(
+                "Simulation log file is missing a TimeStamp column "
+                "(expected something like 'TimeStamp [s]')."
+            )
+
+        entity_slots = []
+        for name_col_stripped in headers:
+            if "entitity_name" in name_col_stripped.lower():  # note: esmini spelling
+                prefix = name_col_stripped.split("Entitity_Name")[0].strip()  # e.g. "#1"
+
+                def _find_with_prefix(suffix: str):
+                    for h in headers:
+                        if h.startswith(prefix) and suffix in h:
+                            return h
+                    return None
+
+                x_col_stripped = _find_with_prefix("World_Position_X")
+                y_col_stripped = _find_with_prefix("World_Position_Y")
+                h_col_stripped = _find_with_prefix("World_Heading_Angle")
+
+                if x_col_stripped and y_col_stripped:
+                    entity_slots.append(
+                        {
+                            "name_col": header_map[name_col_stripped],
+                            "x_col": header_map[x_col_stripped],
+                            "y_col": header_map[y_col_stripped],
+                            "h_col": header_map.get(h_col_stripped) if h_col_stripped else None,
+                        }
+                    )
+
+        if not entity_slots:
+            raise RuntimeError(
+                "Simulation log header does not contain recognizable esmini "
+                "entity columns (Entitity_Name / World_Position_X/Y)."
+            )
+
+        for row in reader:
+            # Parse global timestamp once per row.
+            try:
+                t = float(row[time_col])
+            except (ValueError, TypeError, KeyError):
+                continue
+
+            for slot in entity_slots:
+                name_raw = row.get(slot["name_col"], "")
+                entity_name = str(name_raw).strip()
+                if not entity_name:
+                    continue
+
+                try:
+                    x = float(row[slot["x_col"]])
+                    y = float(row[slot["y_col"]])
+                    h_val = row.get(slot["h_col"]) if slot["h_col"] else None
+                    if h_val not in (None, ""):
+                        h = float(h_val)
+                    else:
+                        h = 0.0
+                except (ValueError, TypeError, KeyError):
+                    # Skip this entity for this row if values are not usable.
+                    continue
+
+                position = type("Position", (), {"x": x, "y": y, "h": h})()
+
+                if entity_name in dynamic_data:
+                    positions, times = dynamic_data[entity_name]
+                    positions.append(position)
+                    times.append(t)
+                else:
+                    dynamic_data[entity_name] = ([position], [t])
+
         return dynamic_data
     
     def _load_parameter_declarations_outside_storyboard(self):
@@ -416,11 +786,17 @@ class FileQualityChecker:
         Check if entity has init position and if entity is parked.
         Args:
             entity_names: List of entity names to inspect.
-        return: (init_positions_dict, parked_entities_list)
+        return: (init_positions_dict, parked_entities_list, unresolved_no_xodr_list, unresolved_conversion_list)
         """
         # Position is taken from TeleportAction; parked if speed is ~0.
         init_positions = {}
         parked_entities = []
+        unresolved_no_xodr = []
+        unresolved_conversion = []
+
+        xodr_path = self.get_xodr_path()
+        has_valid_xodr = xodr_path is not None
+
         for entity in entity_names:
             try:
                 initactions = self.scenario.storyboard.init.initactions[entity]
@@ -431,13 +807,37 @@ class FileQualityChecker:
                 if 'TeleportAction' in str(type(initaction)):
                     if 'WorldPosition' in str(type(initaction.position)):
                         init_positions[entity] = (initaction.position.x, initaction.position.y)
+                    elif 'LanePosition' in str(type(initaction.position)):
+                        if has_valid_xodr:
+                            world_position = self._resolve_lane_position_to_world(initaction.position)
+                            if world_position is not None:
+                                init_positions[entity] = world_position
+                            else:
+                                init_positions[entity] = ('-', '-')
+                                unresolved_conversion.append(entity)
+                        else:
+                            init_positions[entity] = ('-', '-')
+                            unresolved_no_xodr.append(entity)
                     else:
                         init_positions[entity] = ('-', '-')
                 elif 'AbsoluteSpeedAction' in str(type(initaction)):
                     if isinstance(initaction.speed, float) and initaction.speed < 1e-6:
                         parked_entities.append(entity)
 
-        return init_positions, parked_entities
+        return init_positions, parked_entities, list(set(unresolved_no_xodr)), list(set(unresolved_conversion))
+
+    @staticmethod
+    def _is_numeric_position(position_value):
+        if not isinstance(position_value, tuple) or len(position_value) != 2:
+            return False
+        return all(isinstance(v, (int, float, np.floating)) for v in position_value)
+
+    def _resolve_lane_position_to_world(self, lane_position):
+        """Resolve OpenSCENARIO LanePosition to world XY using OpenDRIVE geometry."""
+        xodr_path = self.get_xodr_path()
+        if xodr_path is None:
+            return None
+        return self._xodr_resolver.resolve_lane_position_to_world(xodr_path, lane_position)
 
     @staticmethod
     def _get_identical_initposition_entities(init_positions):
@@ -450,11 +850,13 @@ class FileQualityChecker:
         # Detect duplicate positions by counting identical tuples.
         identical_position_entities = []
 
-        if len(set(init_positions.values())) != len(init_positions.values()):
-            Counter(init_positions.values()).items()
+        valid_positions = {k: v for k, v in init_positions.items() if FileQualityChecker._is_numeric_position(v)}
+
+        if len(set(valid_positions.values())) != len(valid_positions.values()):
+            Counter(valid_positions.values()).items()
             duplicates = [
                 (i, item, count)
-                for i, (item, count) in enumerate(Counter(init_positions.values()).items())
+                for i, (item, count) in enumerate(Counter(valid_positions.values()).items())
                 if count > 1
             ]
 
@@ -462,11 +864,11 @@ class FileQualityChecker:
                 idxs = [idx]
                 current_idx = idx
                 for _ in range(count - 1):
-                    idx_new = current_idx + list(init_positions.values())[current_idx + 1 :].index(item) + 1
+                    idx_new = current_idx + list(valid_positions.values())[current_idx + 1 :].index(item) + 1
                     idxs.append(idx_new)
                     current_idx = idx_new
 
-                identical_position = [list(init_positions.keys())[pos] for pos in idxs]
+                identical_position = [list(valid_positions.keys())[pos] for pos in idxs]
                 identical_position_entities.append(identical_position)
 
         return identical_position_entities
@@ -482,12 +884,14 @@ class FileQualityChecker:
         # Optional radius-based prefilter to reduce pairwise polygon checks.
         intersecting_entites = []
 
-        polygons, max_entity_radius = self._get_entities_bbox(init_positions)
+        valid_init_positions = {k: v for k, v in init_positions.items() if self._is_numeric_position(v)}
+
+        polygons, max_entity_radius = self._get_entities_bbox(valid_init_positions)
         if len(polygons) > 1:
             if filter_by_radius:
                 distances = sp.spatial.distance.cdist(
-                    np.array(list(init_positions.values())),
-                    np.array(list(init_positions.values()))
+                    np.array(list(valid_init_positions.values())),
+                    np.array(list(valid_init_positions.values()))
                 )
                 distances = np.triu(distances)
 
@@ -503,8 +907,8 @@ class FileQualityChecker:
             for index_a, index_b in zip(possible_intersection_indices_a, possible_intersection_indices_b):
                 intersection = polygons[index_a].intersection(polygons[index_b])
                 if not intersection.is_empty:
-                    entity_a = list(init_positions.keys())[index_a]
-                    entity_b = list(init_positions.keys())[index_b]
+                    entity_a = list(valid_init_positions.keys())[index_a]
+                    entity_b = list(valid_init_positions.keys())[index_b]
                     intersecting_entites.append([entity_a, entity_b])
 
         return intersecting_entites
@@ -523,7 +927,7 @@ class FileQualityChecker:
         for scenario_object in self.scenario.entities.scenario_objects:
             if scenario_object.name in init_positions.keys():
                 init_position = init_positions[scenario_object.name]
-                if init_position != ('-', '-') and hasattr(scenario_object.entityobject, 'boundingbox'):
+                if self._is_numeric_position(init_position) and hasattr(scenario_object.entityobject, 'boundingbox'):
                     length = scenario_object.entityobject.boundingbox.boundingbox.length
                     width = scenario_object.entityobject.boundingbox.boundingbox.width
 
@@ -685,9 +1089,10 @@ class FileQualityChecker:
             writer.writerow(['scenario_file', self.file_path])
             writer.writerow(['xml_loadable', self.xml_loadable])
             writer.writerow(['xsd_valid', self.xsd_valid])
-            writer.writerow(['version', self.version])
+            writer.writerow(['version', self.version.replace('-', '.') if self.version else self.version])
             writer.writerow(['author', self.author])
             writer.writerow(['date', self.date])
+            writer.writerow(['simulation_status', self.simulation_status])
             for road_user, count in self.road_user_counts.items():
                 writer.writerow([road_user, count])
             
@@ -705,6 +1110,10 @@ class FileQualityChecker:
             writer.writerow(['missing_in'])
             for missing_in in self.file_errors[3]:
                 writer.writerow([missing_in])
+
+            writer.writerow(['position_resolution_warnings'])
+            for warning in self.position_resolution_warnings:
+                writer.writerow([warning])
             
             writer.writerow([])
             writer.writerow(['dynamic_errors'])
@@ -731,6 +1140,7 @@ def quality_check_single(
     file_path: Path = typer.Option(...),
     out_path: Path = typer.Option(Path("reports/single_reports/")),
     schema_path: Path = typer.Option(Path("schemas/"), help="Path to the schema files"),
+    esmini_path: Path = typer.Option(None, help="Path to the esmini executable. If given, simulation is used to assess dynamics"),
     out_pdf: bool = typer.Option(False),
     out_csv: bool = typer.Option(False),
     print_log: bool = typer.Option(False)): 
@@ -747,7 +1157,7 @@ def quality_check_single(
     """
     
     # Run analysis for one file.
-    fqc = FileQualityChecker(file_path, schema_path, print_log)
+    fqc = FileQualityChecker(file_path, schema_path, esmini_path, print_log)
     
     # Create report (pdf and/or csv).
     if out_pdf:
@@ -765,6 +1175,7 @@ def quality_check_multiple(
     files_path: Path = typer.Option(...),
     out_path: Path = typer.Option(Path("reports/")),
     schema_path: Path = typer.Option(Path("schemas/"), help="Path to the schema files"),
+    esmini_path: Path = typer.Option(None, help="Path to the esmini executable. If given, simulation is used to assess dynamics"),
     single: bool = typer.Option(False),
     aggregated: bool = typer.Option(False),
     out_pdf: bool = typer.Option(False),
@@ -776,6 +1187,7 @@ def quality_check_multiple(
         files_path: Directory containing .xosc files.
         out_path: Output directory for reports.
         schema_path: Path to schema files.
+        esmini_path: Path to the esmini executable.
         single: Whether to generate single reports per file.
         aggregated: Whether to generate an aggregated report.
         out_pdf: Whether to create a PDF report.
@@ -796,9 +1208,9 @@ def quality_check_multiple(
     for file in files_path.glob('*.xosc'):
         if single:
             Path(out_path / Path('single_reports/')).mkdir(exist_ok=True)
-            checker = quality_check_single(file, out_path / Path('single_reports/'), schema_path, out_pdf, out_csv)
+            checker = quality_check_single(file, out_path / Path('single_reports/'), schema_path, esmini_path, out_pdf, out_csv)
         else:
-            checker = quality_check_single(file, out_path / Path('single_reports/'), schema_path, False, False, False)
+            checker = quality_check_single(file, out_path / Path('single_reports/'), schema_path, esmini_path, False, False, False)
 
         if aggregated:
             aggregated_checkers.append(checker)
@@ -812,7 +1224,7 @@ def quality_check_multiple(
             create_report_multiple(title, information_summary, out_path, print_log)
         if out_csv:
             # Prepend a header row for CSV export.
-            information_summary.insert(0, ['scenario_file', 'xml_loadable', 'xsd_valid', 'n_file_errors', 'n_dynamic_errors'])
+            information_summary.insert(0, ['scenario_file', 'xml_loadable', 'xsd_valid', 'simulation_status', 'n_file_errors', 'n_dynamic_errors'])
             csv_file = out_path / Path('aggregate_data.csv')
             with open(csv_file, mode="w", newline="") as file:
                 writer = csv.writer(file)

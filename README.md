@@ -32,6 +32,7 @@ At a high level, the checker:
 4. Dynamics checks
    - For trajectory events, speed, acceleration, and swim angle are derived from positions over time.
    - Entities crossing threshold values are reported as warnings or errors.
+   - If available, a simulation can be conducted to assess more than TrajectoryActions. Therefore, esmini hat to be used.
 
 ## Outputs
 - Per-scenario report: PDF summary and/or CSV detail
@@ -80,6 +81,11 @@ Options:
 - `--out-pdf`: create a PDF report
 - `--out-csv`: create a CSV report
 - `--print-log`: enable log output
+- `--esmini-path`: optional path to an `esmini` executable. If provided,
+  the checker runs a short, headless simulation of the scenario and uses
+  the resulting trajectories for the dynamic checks and trajectory plots
+  instead of only relying on the static trajectory definitions from the
+  `.xosc` file.
 
 ### `quality_check_multiple`
 Checks all `.xosc` files in a directory. Optionally creates per-file and aggregated reports.
@@ -93,6 +99,9 @@ Options:
 - `--out-pdf`: create PDF report(s)
 - `--out-csv`: create CSV report(s)
 - `--print-log`: enable log output
+- `--esmini-path`: optional path to an `esmini` executable. If provided,
+  each scenario is also simulated headless and the resulting trajectories
+  are used for dynamic checks and trajectory plots.
 
 ## Output locations
 Make sure `--out-path` exists when running `quality_check_single`.
@@ -109,6 +118,7 @@ Make sure `--out-path` exists when running `quality_check_single`.
 
 ## Reference
 ASAM OpenSCENARIO standard: https://www.asam.net/standards/detail/openscenario/
+Esmini simulator: https://github.com/esmini/esmini
 
 
 # Acknowledgements
