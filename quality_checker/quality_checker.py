@@ -29,6 +29,9 @@ from .pdf import *
 from .pdf_report_creator import *
 from .xodr_position_resolver import OpenDrivePositionResolver
 
+# Default schema path relative to the package location
+DEFAULT_SCHEMA_PATH = Path(__file__).parent.parent / "schemas"
+
 app = typer.Typer()
 
 
@@ -1139,7 +1142,7 @@ class FileQualityChecker:
 def quality_check_single(
     file_path: Path = typer.Option(...),
     out_path: Path = typer.Option(Path("reports/single_reports/")),
-    schema_path: Path = typer.Option(Path("schemas/"), help="Path to the schema files"),
+    schema_path: Path = typer.Option(DEFAULT_SCHEMA_PATH, help="Path to the schema files"),
     esmini_path: Path = typer.Option(None, help="Path to the esmini executable. If given, simulation is used to assess dynamics"),
     out_pdf: bool = typer.Option(False),
     out_csv: bool = typer.Option(False),
@@ -1174,7 +1177,7 @@ def quality_check_single(
 def quality_check_multiple(
     files_path: Path = typer.Option(...),
     out_path: Path = typer.Option(Path("reports/")),
-    schema_path: Path = typer.Option(Path("schemas/"), help="Path to the schema files"),
+    schema_path: Path = typer.Option(DEFAULT_SCHEMA_PATH, help="Path to the schema files"),
     esmini_path: Path = typer.Option(None, help="Path to the esmini executable. If given, simulation is used to assess dynamics"),
     single: bool = typer.Option(False),
     aggregated: bool = typer.Option(False),
