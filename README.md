@@ -51,21 +51,25 @@ pip install -r requirements.txt
 Single file with PDF and CSV:
 
 ```bash
-python -m quality_checker quality_check_single `
-  --file-path example_files/envelope_dynamic_error_1.xosc `
-  --out-path reports/ `
-  --schema-path schemas/ `
-  --out-pdf --out-csv
+python -m quality_checker quality_check_single \
+  --file-path example_files/envelope_dynamic_error_1.xosc \
+  --out-path reports/ \
+  --schema-path schemas/ \
+  --out-pdf \
+  --out-csv
 ```
 
 Multiple files with per-file and aggregated outputs:
 
 ```bash
-python -m quality_checker quality_check_multiple `
-  --files-path example_files/ `
-  --out-path reports/ `
-  --schema-path schemas/ `
-  --single --aggregated --out-pdf --out-csv
+python -m quality_checker quality_check_multiple \
+  --files-path example_files/ \
+  --out-path reports/ \
+  --schema-path schemas/ \
+  --single \
+  --aggregated \
+  --out-pdf \
+  --out-csv
 ```
 
 ## Command reference
